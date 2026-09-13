@@ -8,6 +8,7 @@ here; every input is a plain day -> value dict discovered from the data.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, NamedTuple, Optional
 
 
@@ -50,13 +51,18 @@ def find_rate_changepoint(num_by_day: Dict[int, float], den_by_day: Dict[int, fl
       that: it can only ever fill in an absence, never overrule a real signal.
 
     criterion:
-      "abs_delta" (default) — largest |after - before|. Right for a metric that
-        settles at a new level (a permanent regression, a rubric change).
-      "rise_ratio" / "fall_ratio" — largest after/before (or before/after) ratio.
-        Right for a temporary SPIKE: a spike's onset and its recovery are both
-        large by abs_delta (the recovery is just the mirror image), so abs_delta
-        can lock onto the wrong edge. Ratio search only rewards the direction
-        that matches the shape being hunted for.
+      "abs_delta" (default) — largest |after - before|, either direction. Only
+        safe when the shape has ONE edge inside the data (a permanent change).
+      "rise" / "fall" — largest signed increase (or decrease). Use these for any
+        fault that can END inside the corpus: its onset and its recovery are
+        mirror images of roughly equal size, and abs_delta picks whichever is a
+        hair larger. When it picks the recovery, the scanner sees the metric
+        going the wrong way and discards a real fault. That is exactly how the
+        turn-inflation and silent-tool scanners used to miss faults on every
+        corpus where the fault recovered before the last day. Unlike the ratio
+        criteria these work from a zero baseline (an empty-payload rate of 0).
+      "rise_ratio" / "fall_ratio" — largest after/before (or before/after)
+        ratio; skips zero baselines. Right for volume/share spikes.
     """
     def _scan(d_range, clip):
         best = None
@@ -87,12 +93,16 @@ def find_rate_changepoint(num_by_day: Dict[int, float], den_by_day: Dict[int, fl
                 if best is None or score > best[0]:
                     best = (score, cur)
             else:
-                if best is None or abs(delta) > abs(best.delta):
-                    best = cur
+                if criterion == "rise":
+                    score = delta
+                elif criterion == "fall":
+                    score = -delta
+                else:
+                    score = abs(delta)
+                if best is None or score > best[0]:
+                    best = (score, cur)
 
-        if criterion in ("rise_ratio", "fall_ratio"):
-            return best[1] if best else None
-        return best
+        return best[1] if best else None
 
     strict = _scan(range(first_day + window, last_day - window + 2), clip=False)
     if strict is not None or not allow_partial_window:
@@ -121,6 +131,44 @@ def find_recovery_day(num_by_day: Dict[int, float], den_by_day: Dict[int, float]
                 return d
         d += 1
     return None
+
+
+def window_bounds(first_day: int, last_day: int, day: int, window: int):
+    """(before_lo, before_hi, after_lo, after_hi), inclusive, clipped to the data —
+    the same windows find_rate_changepoint compared at `day`."""
+    return max(first_day, day - window), day - 1, day, min(last_day, day + window - 1)
+
+
+def sum_range(by_day: Dict[int, float], lo: int, hi: int) -> float:
+    return sum(by_day.get(d, 0) for d in range(lo, hi + 1))
+
+
+def z_two_proportions(x1: float, n1: float, x2: float, n2: float) -> Optional[float]:
+    """Pooled two-proportion z for (x2/n2 - x1/n1). A size gate on its own lets a
+    thin cohort's noise through; this makes every rate detector ask whether the
+    move is large relative to its own sampling error."""
+    if n1 <= 0 or n2 <= 0:
+        return None
+    p = (x1 + x2) / float(n1 + n2)
+    diff = x2 / float(n2) - x1 / float(n1)
+    se = math.sqrt(p * (1.0 - p) * (1.0 / n1 + 1.0 / n2))
+    if se == 0:
+        return 0.0 if diff == 0 else math.copysign(float("inf"), diff)
+    return diff / se
+
+
+def z_two_means(sum1: float, sumsq1: float, n1: float, sum2: float, sumsq2: float, n2: float) -> Optional[float]:
+    """Welch z for (mean2 - mean1) from running sums and sums of squares."""
+    if n1 < 2 or n2 < 2:
+        return None
+    m1, m2 = sum1 / n1, sum2 / n2
+    v1 = max(0.0, (sumsq1 - n1 * m1 * m1) / (n1 - 1))
+    v2 = max(0.0, (sumsq2 - n2 * m2 * m2) / (n2 - 1))
+    se = math.sqrt(v1 / n1 + v2 / n2)
+    diff = m2 - m1
+    if se == 0:
+        return 0.0 if diff == 0 else math.copysign(float("inf"), diff)
+    return diff / se
 
 
 def percentile(values, p: float) -> Optional[float]:

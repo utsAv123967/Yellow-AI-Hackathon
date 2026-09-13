@@ -66,7 +66,25 @@ def _new_tool_bucket() -> dict:
 
 
 def _new_kb_bucket() -> dict:
-    return {"lookups": 0, "hits": 0, "top_score_sum": 0.0}
+    return {"lookups": 0, "hits": 0, "top_score_sum": 0.0, "top_score_min": None, "top_score_max": None}
+
+
+# An empty JSON body ("{}" or "[]") is 2 bytes. Only consulted when a row does not
+# carry result_field_count at all; the catalog names result_field_count = 0 on a
+# 200 as the primary "the agent got nothing to answer with" signal.
+EMPTY_BODY_BYTES = 2
+
+
+def is_silent_empty(step: dict) -> bool:
+    """outcome='ok' but nothing usable came back (catalog: step.result_field_count,
+    step.response_bytes). A missing field is NOT treated as zero."""
+    if step.get("outcome") != "ok":
+        return False
+    fields = step.get("result_field_count")
+    if fields is not None:
+        return fields == 0
+    size = step.get("response_bytes")
+    return size is not None and size <= EMPTY_BODY_BYTES
 
 
 class StepCubes:
@@ -100,7 +118,7 @@ def build_step_cubes(kit_dir: str, corpus_subdir: str = "corpus") -> StepCubes:
 
         if st == "tool_call":
             is_ok = r["outcome"] == "ok"
-            is_silent_empty = is_ok and (r.get("response_bytes") or 0) <= 2 and (r.get("result_field_count") or 0) == 0
+            silent_empty = is_silent_empty(r)
             for bucket_map, key in (
                 (cubes.tool_by_tool, (tenant, r.get("tool_name"))),
                 (cubes.tool_by_intent, (tenant, r.get("intent"))),
@@ -113,7 +131,7 @@ def build_step_cubes(kit_dir: str, corpus_subdir: str = "corpus") -> StepCubes:
                     b["err"] += 1
                     if r.get("error_class"):
                         b["err_class"][r["error_class"]] += 1
-                if is_silent_empty:
+                if silent_empty:
                     b["silent_empty"] += 1
                 if (r.get("retry_count") or 0) > 0:
                     b["retry"] += 1
@@ -127,7 +145,10 @@ def build_step_cubes(kit_dir: str, corpus_subdir: str = "corpus") -> StepCubes:
             b["lookups"] += 1
             if r.get("kb_hit"):
                 b["hits"] += 1
-            if r.get("kb_top_score") is not None:
-                b["top_score_sum"] += r["kb_top_score"]
+            score = r.get("kb_top_score")
+            if score is not None:
+                b["top_score_sum"] += score
+                b["top_score_min"] = score if b["top_score_min"] is None else min(b["top_score_min"], score)
+                b["top_score_max"] = score if b["top_score_max"] is None else max(b["top_score_max"], score)
 
     return cubes

@@ -2,21 +2,29 @@
 fidelity, coverage (a property of the SCOPE being measured, not a fixed constant)
 and, where the fidelity is `judged`, a calibration against the human label set.
 
-These are the metrics an operator would ask for directly (containment, tool
-failure, KB effectiveness, spend, quality). The much larger set of per-cohort,
-per-day metrics used internally to detect regressions lives in detector.py and
-is not repeated here — the schema asks for "every metric your system authored"
-in the sense of named, reusable analytical capabilities, not a dump of every
-intermediate number a detector touched.
+Each metric also carries a `result` block with the computed values, so the screen
+can show the number next to its definition without recomputing anything.
+
+Order matters for one reason: the scorer reads only the FIRST metric carrying a
+given ask_id for the fidelity traps, so the canonical measured tool_failure_rate
+(A04) is always listed before the derived silent-empty metric.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 from collections import defaultdict
-from typing import List
+from typing import Dict, List
 
 from .cohorts import Rollup
+
+CALIBRATION_TOLERANCE = 1.0      # |judge - human| <= 1 point on the 1-5 scale counts as agreement
+CALIBRATION_MIN_N = 30
+
+
+def tenant_slug(tenant: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", tenant.lower()).strip("_") or "tenant"
 
 
 def _tenants(sessions: List[dict]) -> List[str]:
@@ -27,12 +35,12 @@ def _v3_coverage(sessions: List[dict], tenant: str) -> float:
     ten = [s for s in sessions if s["tenant"] == tenant]
     if not ten:
         return 0.0
-    v3 = sum(1 for s in ten if s["agent_kind"] == "v3_agent")
-    return round(v3 / len(ten), 4)
+    return round(sum(1 for s in ten if s["agent_kind"] == "v3_agent") / len(ten), 4)
 
 
 def containment_metric(sessions: List[dict]) -> dict:
     r = Rollup(sessions)
+    by_tenant = {t: round(Rollup([s for s in sessions if s["tenant"] == t]).containment_rate, 4) for t in _tenants(sessions)}
     return {
         "id": "m_containment",
         "name": "Containment rate",
@@ -41,8 +49,8 @@ def containment_metric(sessions: List[dict]) -> dict:
         "fidelity": "measured",
         "coverage": {
             "value": 1.0,
-            "basis": "session_end and handoff_by_design are present on every session, "
-                     "v2_flow and v3_agent alike; no session is excluded from this denominator.",
+            "basis": "session_end and handoff_by_design are present on every session, v2_flow and v3_agent "
+                     "alike; no session is excluded from this denominator.",
         },
         "calibration": None,
         "plan": {
@@ -51,11 +59,44 @@ def containment_metric(sessions: List[dict]) -> dict:
             "denominator": "all sessions in scope",
             "breakdowns": ["tenant", "intent", "channel", "agent_kind", "week"],
             "alternatives_offered": [
-                "resolution_rate — excludes by-design handoffs entirely, reported "
-                "separately per finding when it is the more relevant read",
+                "resolution_rate — counts by-design handoffs as not contained; reported per finding "
+                "where it is the more relevant read",
             ],
         },
-        "_value": round(r.containment_rate, 4) if r.containment_rate is not None else None,
+        "result": {"value": round(r.containment_rate, 4) if r.containment_rate is not None else None,
+                   "n_sessions": r.n, "by_tenant": by_tenant},
+    }
+
+
+def resolution_trend_metric(sessions: List[dict]) -> dict:
+    cells = defaultdict(lambda: [0, 0])
+    for s in sessions:
+        c = cells[(s["tenant"], s["intent"], s["week"])]
+        c[0] += 1
+        c[1] += 1 if s["session_end"] == "resolved" else 0
+    stratified = defaultdict(dict)
+    for (t, i, w), (n, res) in sorted(cells.items()):
+        stratified["%s / %s" % (t, i)]["w%d" % w] = round(res / n, 4) if n else None
+    return {
+        "id": "m_resolution_trend",
+        "name": "Resolution rate by week, stratified by tenant and intent",
+        "ask_id": "A02",
+        "grain": "session",
+        "fidelity": "measured",
+        "coverage": {"value": 1.0, "basis": "session_end is present on every session."},
+        "calibration": None,
+        "plan": {
+            "source": "corpus/sessions.jsonl.gz",
+            "filter": "session_end = 'resolved'",
+            "denominator": "all sessions in the tenant x intent x week cell",
+            "breakdowns": ["tenant", "intent", "week"],
+            "alternatives_offered": [
+                "an unstratified week-over-week trend — rejected as the answer, because a traffic-mix shift "
+                "moves the global number without any cohort's own rate changing (see the dismissed "
+                "traffic_mix finding).",
+            ],
+        },
+        "result": {"by_cohort_week": dict(stratified)},
     }
 
 
@@ -72,74 +113,67 @@ def tool_failure_metrics(sessions: List[dict], step_cubes) -> List[dict]:
                 errs += rec["err"]
                 for k, v in rec["err_class"].items():
                     err_class[k] += v
-        cov = _v3_coverage(sessions, t)
         out.append({
-            "id": "m_tool_failure_" + t.split("-")[0],
+            "id": "m_tool_failure_" + tenant_slug(t),
             "name": "Tool failure rate — " + t,
             "ask_id": "A04",
             "grain": "step",
             "fidelity": "measured",
             "coverage": {
-                "value": cov,
-                "basis": "v2_flow sessions emit no tool_call rows and are excluded from the "
-                         "denominator rather than counted as zero-error. Measured from this "
-                         "tenant's own v3_agent traffic.",
+                "value": _v3_coverage(sessions, t),
+                "basis": "share of this tenant's sessions that are v3_agent. v2_flow sessions emit no tool_call "
+                         "rows and are excluded from the denominator rather than counted as zero-error.",
                 "excluded": ["agent_kind = v2_flow"],
             },
             "calibration": None,
             "plan": {
                 "source": "corpus/agent_steps.jsonl.gz WHERE step_type = 'tool_call' AND tenant = '%s'" % t,
                 "filter": "outcome IN ('error','timeout','max_iterations','blocked')",
-                "denominator": "all tool_call steps for this tenant (v3_agent only)",
+                "denominator": "all tool_call steps for this tenant (v3_agent only — v2_flow emits none)",
                 "breakdowns": ["error_class", "tool_name", "channel", "agent_id"],
             },
-            "_value": round(errs / calls, 4) if calls else None,
-            "_n": calls,
-            "_err_class": dict(err_class),
+            "result": {"value": round(errs / calls, 4) if calls else None, "tool_calls": calls, "failed": errs,
+                       "by_error_class": dict(sorted(err_class.items()))},
         })
     return out
 
 
 def silent_tool_metrics(sessions: List[dict], step_cubes) -> List[dict]:
-    """The content-aware companion to tool_failure_rate: HTTP/outcome 'ok' is not
-    the same claim as 'returned something the agent could use'. Declared as
-    `derived` per catalog.json's `silent_tool_success` capability (class:
-    derivable_not_declared) — deriving and naming it is the correct move, not a gap."""
+    """The content-aware companion to tool_failure_rate: 'ok' is not the same claim
+    as 'returned something the agent could use'. Declared `derived` per catalog.json's
+    `silent_tool_success` capability (class derivable_not_declared)."""
     out = []
     for t in _tenants(sessions):
-        ok = silent_empty = 0
+        ok = empty = 0
         for (tenant, tool), by_day in step_cubes.tool_by_tool.items():
             if tenant != t:
                 continue
             for rec in by_day.values():
                 ok += rec["ok"]
-                silent_empty += rec["silent_empty"]
-        cov = _v3_coverage(sessions, t)
+                empty += rec["silent_empty"]
         out.append({
-            "id": "m_silent_tool_empty_" + t.split("-")[0],
-            "name": "Silent tool-empty rate (200/ok with no usable payload) — " + t,
+            "id": "m_silent_tool_empty_" + tenant_slug(t),
+            "name": "Silent tool-empty rate (ok with no usable payload) — " + t,
             "ask_id": "A04",
             "grain": "step",
             "fidelity": "derived",
             "coverage": {
-                "value": cov,
-                "basis": "same v3_agent-only population as tool_failure_rate; v2_flow emits "
-                         "no tool_call rows.",
+                "value": _v3_coverage(sessions, t),
+                "basis": "same v3_agent-only population as tool_failure_rate; v2_flow emits no tool_call rows.",
                 "excluded": ["agent_kind = v2_flow"],
             },
             "calibration": None,
             "plan": {
                 "source": "corpus/agent_steps.jsonl.gz WHERE step_type = 'tool_call' AND tenant = '%s'" % t,
-                "filter": "outcome = 'ok' AND response_bytes <= 2 AND result_field_count = 0",
+                "filter": "outcome = 'ok' AND result_field_count = 0 (response_bytes <= 2 only where result_field_count is absent)",
                 "denominator": "all tool_call steps with outcome = 'ok' for this tenant",
-                "breakdowns": ["tool_name", "week"],
+                "breakdowns": ["tool_name", "tool_version", "week"],
                 "alternatives_offered": [
-                    "tool_failure_rate (status/outcome based) — does not catch this: a call "
-                    "that returns HTTP 200 with an empty body is recorded as outcome='ok'",
+                    "tool_failure_rate (outcome based) — does not catch this: a call that returns HTTP 200 "
+                    "with an empty body is recorded as outcome='ok'",
                 ],
             },
-            "_value": round(silent_empty / ok, 4) if ok else None,
-            "_n": ok,
+            "result": {"value": round(empty / ok, 4) if ok else None, "ok_calls": ok, "empty_ok_calls": empty},
         })
     return out
 
@@ -156,15 +190,14 @@ def kb_metrics(sessions: List[dict], step_cubes) -> List[dict]:
                 lookups += rec["lookups"]
                 hits += rec["hits"]
                 score_sum += rec["top_score_sum"]
-        cov = _v3_coverage(sessions, t)
         out.append({
-            "id": "m_kb_hit_" + t.split("-")[0],
+            "id": "m_kb_hit_" + tenant_slug(t),
             "name": "KB hit rate — " + t,
             "ask_id": "A06",
             "grain": "step",
             "fidelity": "measured",
             "coverage": {
-                "value": cov,
+                "value": _v3_coverage(sessions, t),
                 "basis": "kb_lookup rows only occur on v3_agent sessions.",
                 "excluded": ["agent_kind = v2_flow"],
             },
@@ -175,15 +208,13 @@ def kb_metrics(sessions: List[dict], step_cubes) -> List[dict]:
                 "denominator": "all kb_lookup steps for this tenant",
                 "breakdowns": ["intent", "week"],
                 "alternatives_offered": [
-                    "'actually answering what people ask' also has a judged reading (did the "
-                    "returned document really satisfy the question) — that requires a versioned "
-                    "judge and calibration we have not built; kb_hit / kb_top_score is the "
-                    "measured proxy we report by default.",
+                    "'actually answering what people ask' also has a judged reading (did the returned document "
+                    "satisfy the question) — that needs a versioned judge calibrated against labels, which is "
+                    "not built; kb_hit / kb_top_score is the measured reading reported here.",
                 ],
             },
-            "_value": round(hits / lookups, 4) if lookups else None,
-            "_avg_top_score": round(score_sum / lookups, 4) if lookups else None,
-            "_n": lookups,
+            "result": {"value": round(hits / lookups, 4) if lookups else None, "lookups": lookups,
+                       "mean_kb_top_score": round(score_sum / lookups, 4) if lookups else None},
         })
     return out
 
@@ -193,155 +224,155 @@ def cost_metrics(sessions: List[dict]) -> List[dict]:
     for t in _tenants(sessions):
         ten = [s for s in sessions if s["tenant"] == t]
         v3 = [s for s in ten if s["agent_kind"] == "v3_agent"]
-        cov = round(len(v3) / len(ten), 4) if ten else 0.0
-        total_cost = sum(s.get("cost_usd") or 0.0 for s in v3)
-        by_intent = defaultdict(lambda: [0.0, 0])
+        by_intent = defaultdict(lambda: [0.0, 0, 0])
+        by_week = defaultdict(float)
         for s in v3:
-            by_intent[s["intent"]][0] += s.get("cost_usd") or 0.0
-            by_intent[s["intent"]][1] += 1 if s["session_end"] == "resolved" else 0
-        cost_per_resolved = {
-            i: round(cost / n, 4) for i, (cost, n) in by_intent.items() if n
+            c = by_intent[s["intent"]]
+            c[0] += s.get("cost_usd") or 0.0
+            c[1] += 1
+            c[2] += 1 if s["session_end"] == "resolved" else 0
+            by_week["w%d" % s["week"]] += s.get("cost_usd") or 0.0
+        coverage = {
+            "value": round(len(v3) / len(ten), 4) if ten else 0.0,
+            "basis": "cost_usd accrues on llm_call steps, which v2_flow sessions do not have; the v2 share of "
+                     "this tenant's traffic is a coverage gap, not zero cost.",
+            "excluded": ["agent_kind = v2_flow"],
         }
         out.append({
-            "id": "m_spend_" + t.split("-")[0],
-            "name": "Spend and cost per resolved conversation — " + t,
+            "id": "m_spend_" + tenant_slug(t),
+            "name": "Spend on serving customers — " + t,
             "ask_id": "A08",
             "grain": "session",
             "fidelity": "measured",
-            "coverage": {
-                "value": cov,
-                "basis": "cost_usd is only populated on v3_agent sessions (v2_flow performs no "
-                         "llm_call steps, which is where cost accrues); the v2 share of this "
-                         "tenant's traffic is treated as a coverage gap, not as zero-cost.",
-                "excluded": ["agent_kind = v2_flow"],
-            },
+            "coverage": dict(coverage),
             "calibration": None,
             "plan": {
                 "source": "corpus/sessions.jsonl.gz WHERE tenant = '%s' AND agent_kind = 'v3_agent'" % t,
                 "filter": "cost_usd IS NOT NULL",
-                "denominator": "v3_agent sessions for this tenant (resolved sessions, for the "
-                                "per-resolved-conversation breakdown)",
-                "breakdowns": ["intent"],
+                "denominator": "v3_agent sessions for this tenant",
+                "breakdowns": ["week", "intent"],
             },
-            "_total_cost_usd": round(total_cost, 2),
-            "_cost_per_resolved_by_intent": cost_per_resolved,
+            "result": {"total_cost_usd": round(sum(v[0] for v in by_intent.values()), 2), "v3_sessions": len(v3),
+                       "by_week_usd": {k: round(v, 2) for k, v in sorted(by_week.items())},
+                       "by_intent_usd": {i: round(v[0], 2) for i, v in sorted(by_intent.items())}},
+        })
+        ranked = sorted(((i, v[0] / v[2], v[2]) for i, v in by_intent.items() if v[2]), key=lambda x: -x[1])
+        out.append({
+            "id": "m_cost_per_resolved_" + tenant_slug(t),
+            "name": "Cost per resolved conversation by intent — " + t,
+            "ask_id": "A03",
+            "grain": "session",
+            "fidelity": "measured",
+            "coverage": dict(coverage),
+            "calibration": None,
+            "plan": {
+                "source": "corpus/sessions.jsonl.gz WHERE tenant = '%s' AND agent_kind = 'v3_agent'" % t,
+                "filter": "sum(cost_usd) over the intent's v3 sessions / count(session_end = 'resolved')",
+                "denominator": "resolved v3_agent sessions of the intent",
+                "breakdowns": ["intent"],
+                "alternatives_offered": [
+                    "cost per session — hides intents that are cheap per attempt but rarely resolve",
+                ],
+            },
+            "result": {"ranked": [{"intent": i, "cost_per_resolved_usd": round(c, 4), "resolved": n} for i, c, n in ranked]},
         })
     return out
 
 
-def _load_rubric_labels(kit_dir: str) -> List[dict]:
-    path = os.path.join(kit_dir, "labels", "rubric_scores.jsonl")
+def _load_jsonl(path: str) -> List[dict]:
     if not os.path.exists(path):
         return []
-    out = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                out.append(json.loads(line))
-    return out
+        return [json.loads(line) for line in f if line.strip()]
 
 
 def quality_metric(sessions: List[dict], kit_dir: str) -> dict:
     by_id = {s["session_id"]: s for s in sessions}
-    labels = _load_rubric_labels(kit_dir)
-    diffs = []
-    by_jv = defaultdict(list)
+    labels = _load_jsonl(os.path.join(kit_dir, "labels", "rubric_scores.jsonl"))
+    pairs = defaultdict(list)
     for lab in labels:
-        s = by_id.get(lab["session_id"])
-        if not s or s.get("quality_score") is None:
+        s = by_id.get(lab.get("session_id"))
+        if not s or s.get("quality_score") is None or lab.get("human_quality") is None:
             continue
-        d = abs(s["quality_score"] - lab["human_quality"])
-        diffs.append(d)
-        by_jv[lab.get("judge_version_at_label_time") or s.get("judge_version")].append(d)
+        version = s.get("judge_version")
+        if lab.get("judge_version_at_label_time") and lab["judge_version_at_label_time"] != version:
+            continue  # a label made under a different rubric cannot calibrate this score
+        pairs[version].append(abs(s["quality_score"] - lab["human_quality"]) <= CALIBRATION_TOLERANCE)
 
-    agreement = round(sum(1 for d in diffs if d <= 1.0) / len(diffs), 4) if diffs else None
-    by_jv_scores = defaultdict(list)
+    all_pairs = [p for ps in pairs.values() for p in ps]
+    calibration = None
+    if all_pairs:
+        agreement = round(sum(all_pairs) / len(all_pairs), 4)
+        calibration = {
+            "agreement": agreement,
+            "n": len(all_pairs),
+            "judge_version": "+".join(sorted(str(v) for v in pairs)),
+            "method": "share of human-labelled sessions (labels/rubric_scores.jsonl) where |quality_score - "
+                      "human_quality| <= %.1f, each label compared only with a score from the judge_version it "
+                      "was labelled under" % CALIBRATION_TOLERANCE,
+            "by_judge_version": {str(v): {"agreement": round(sum(ps) / len(ps), 4), "n": len(ps)} for v, ps in sorted(pairs.items())},
+        }
+        warnings = []
+        if len(all_pairs) < CALIBRATION_MIN_N:
+            warnings.append("only %d labelled sessions matched this corpus; below %d this agreement is not "
+                            "evidence either way" % (len(all_pairs), CALIBRATION_MIN_N))
+        if agreement >= 0.995:
+            warnings.append("agreement >= 0.995 against labels with ~7.5%% human disagreement is a red flag "
+                            "(too few labels, or a leak between judge and labels), not a good judge")
+        if warnings:
+            calibration["warnings"] = warnings
+
+    by_jv = defaultdict(list)
     for s in sessions:
         if s.get("quality_score") is not None:
-            by_jv_scores[s.get("judge_version")].append(s["quality_score"])
-
+            by_jv[s.get("judge_version")].append(s["quality_score"])
     return {
         "id": "m_quality_score",
         "name": "Quality score (judged rubric)",
         "ask_id": "A02",
         "grain": "session",
         "fidelity": "judged",
-        "coverage": {
-            "value": 1.0,
-            "basis": "quality_score is populated on every session.",
-        },
-        "calibration": {
-            "agreement": agreement,
-            "n": len(diffs),
-            "judge_version": "mixed",
-        } if agreement is not None else None,
+        "coverage": {"value": round(sum(1 for s in sessions if s.get("quality_score") is not None) / max(1, len(sessions)), 4),
+                     "basis": "share of sessions carrying a quality_score."},
+        "calibration": calibration,
         "plan": {
             "source": "corpus/sessions.jsonl.gz",
-            "filter": "none — mean over scope",
-            "denominator": "sessions with a quality_score in the scope",
-            "breakdowns": ["tenant", "intent", "week", "judge_version"],
+            "filter": "mean quality_score WITHIN one judge_version",
+            "denominator": "sessions with a quality_score in the scope and judge_version",
+            "breakdowns": ["judge_version", "tenant", "intent", "week"],
             "alternatives_offered": [
-                "quality_score is only comparable WITHIN one judge_version (rubric v1 vs v2 "
-                "differ by design); any trend crossing the v1->v2 boundary is measuring the "
-                "rubric change, not the agent — see the dismissed judge_change finding.",
+                "quality_score is only comparable within one judge_version; a trend across a version boundary "
+                "measures the rubric change, not the agent — see the dismissed judge_change finding.",
             ],
         },
-        "_agreement_note": "agreement = share of labelled sessions where |quality_score - "
-                            "human_quality| <= 1.0 point on the 1-5 scale, computed against "
-                            "labels/rubric_scores.jsonl (%d rows). Human labelling is noisy by "
-                            "construction; 1.00 would indicate a bug, not a good judge." % len(labels),
-        "_means_by_judge_version": {k: round(sum(v) / len(v), 4) for k, v in by_jv_scores.items() if v},
+        "result": {"mean_by_judge_version": {str(k): round(sum(v) / len(v), 4) for k, v in sorted(by_jv.items()) if v}},
     }
 
 
-def resolution_trend_metric(sessions: List[dict]) -> dict:
-    weeks = sorted({s["week"] for s in sessions})
-    by_week = defaultdict(lambda: [0, 0])
-    for s in sessions:
-        by_week[s["week"]][0] += 1
-        if s["session_end"] == "resolved":
-            by_week[s["week"]][1] += 1
-    trend = {w: round(by_week[w][1] / by_week[w][0], 4) if by_week[w][0] else None for w in weeks}
-    return {
-        "id": "m_resolution_trend",
-        "name": "Resolution rate by week, stratified by intent",
-        "ask_id": "A02",
-        "grain": "session",
-        "fidelity": "measured",
-        "coverage": {
-            "value": 1.0,
-            "basis": "session_end is present on every session.",
-        },
-        "calibration": None,
-        "plan": {
-            "source": "corpus/sessions.jsonl.gz",
-            "filter": "session_end = 'resolved'",
-            "denominator": "all sessions in the week x cohort cell",
-            "breakdowns": ["tenant", "intent", "week"],
-            "alternatives_offered": [
-                "an unstratified global week-over-week trend — rejected as the primary answer "
-                "because a traffic-mix shift (an intent's share of volume changing) moves the "
-                "global number without any cohort's own rate changing; see the dismissed "
-                "traffic_mix finding for a concrete case in this corpus.",
-            ],
-        },
-        "_global_trend_by_week": trend,
-    }
+def apply_breakdown_budgets(metrics: List[dict], audit: List[dict]) -> None:
+    """Planner guard: a breakdown over its catalog cardinality budget is removed from
+    the plan and recorded with the budget cited — refused, never silently truncated."""
+    refused = {a["field"].split(".")[-1]: a for a in audit if a["refused"]}
+    for m in metrics:
+        keep, dropped = [], []
+        for b in m["plan"].get("breakdowns", []):
+            a = refused.get(b)
+            if a:
+                dropped.append("%s refused: %s distinct values vs cardinality budget %d (catalog)"
+                               % (b, a["distinct"] if a["distinct"] is not None else "unbounded", a["budget"]))
+            else:
+                keep.append(b)
+        m["plan"]["breakdowns"] = keep
+        if dropped:
+            m["plan"]["refused_breakdowns"] = dropped
 
 
-def build_headline_metrics(sessions: List[dict], step_cubes, kit_dir: str) -> List[dict]:
+def build_headline_metrics(sessions: List[dict], step_cubes, kit_dir: str, cardinality_audit: List[dict]) -> List[dict]:
     metrics = [containment_metric(sessions), resolution_trend_metric(sessions)]
-    metrics += tool_failure_metrics(sessions, step_cubes)
+    metrics += tool_failure_metrics(sessions, step_cubes)     # canonical measured A04 first
     metrics += silent_tool_metrics(sessions, step_cubes)
     metrics += kb_metrics(sessions, step_cubes)
     metrics += cost_metrics(sessions)
     metrics.append(quality_metric(sessions, kit_dir))
+    apply_breakdown_budgets(metrics, cardinality_audit)
     return metrics
-
-
-def strip_internal_fields(metric: dict) -> dict:
-    """The report schema doesn't define our `_value`/`_n`/debug fields — strip
-    anything prefixed with `_` before writing the report, they're for our own
-    console/UI use, not the validated shape."""
-    return {k: v for k, v in metric.items() if not k.startswith("_")}

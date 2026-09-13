@@ -1,38 +1,60 @@
-"""Assemble the final dict to the exact shape of schema/loop-report.schema.json
-and validate it with `jsonschema` before it's ever written to disk. There is no
-`nlkit.schema` module to lean on (see plan.md's Setup Validation) — we build the
-dict by hand and validate against the kit's own schema file directly.
+"""Assemble the final dict to the shape of schema/loop-report.schema.json.
+
+Validation uses nexus_loop.schema_check (stdlib only). The pipeline writes the
+report FIRST and validates it second, so a validation problem is reported loudly
+without ever leaving the sealed run with no output at all.
 """
 from __future__ import annotations
 
 import datetime
-import json
-from typing import List
+from typing import List, Optional
 
-from . import metrics as metrics_mod
+from . import schema_check
 
 
-def build_report(team: str, corpus_variant: str, sessions: List[dict], step_cubes,
-                  findings: List[dict], diagnoses: List[dict], gaps: List[dict],
-                  kit_dir: str, system_notes: str, standard: List[dict] = None) -> dict:
-    headline = metrics_mod.build_headline_metrics(sessions, step_cubes, kit_dir)
+def build_report(team: str, corpus_variant: str, metrics: List[dict], findings: List[dict],
+                  diagnoses: List[dict], gaps: List[dict], system_notes: str,
+                  standard: Optional[List[dict]] = None, prescriptions: Optional[List[dict]] = None,
+                  verifications: Optional[List[dict]] = None, self_assessment: Optional[dict] = None) -> dict:
     report = {
         "team": team,
         "corpus": corpus_variant,
-        "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "system_notes": system_notes,
-        "metrics": [metrics_mod.strip_internal_fields(m) for m in headline],
+        "metrics": metrics,
         "findings": findings,
         "diagnoses": diagnoses,
         "gaps": gaps,
     }
     if standard:
         report["standard"] = standard
+    report["prescriptions"] = prescriptions or []
+    report["verifications"] = verifications or []
+    if self_assessment is not None:
+        report["self_assessment"] = self_assessment
     return report
 
 
-def validate_report(report: dict, schema_path: str) -> None:
-    import jsonschema
-    with open(schema_path, encoding="utf-8") as f:
-        schema = json.load(f)
-    jsonschema.validate(instance=report, schema=schema)
+def validate_report(report: dict, schema_path: str) -> List[str]:
+    return schema_check.validate_file(report, schema_path)
+
+
+def link_errors(report: dict) -> List[str]:
+    """Referential checks the JSON schema cannot express."""
+    errors = []
+    fids = {f["id"] for f in report["findings"]}
+    dids = {d["id"] for d in report["diagnoses"]}
+    pids = {p["id"] for p in report.get("prescriptions", [])}
+    for d in report["diagnoses"]:
+        if d["finding_id"] not in fids:
+            errors.append("diagnosis %s -> missing finding %s" % (d["id"], d["finding_id"]))
+    for p in report.get("prescriptions", []):
+        if p["diagnosis_id"] not in dids:
+            errors.append("prescription %s -> missing diagnosis %s" % (p["id"], p["diagnosis_id"]))
+    for v in report.get("verifications", []):
+        if v["prescription_id"] not in pids:
+            errors.append("verification -> missing prescription %s" % v["prescription_id"])
+    for f in report["findings"]:
+        if not f["is_regression"] and not f.get("not_a_regression_because"):
+            errors.append("dismissed finding %s has no not_a_regression_because" % f["id"])
+    return errors
